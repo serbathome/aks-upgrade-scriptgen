@@ -20,21 +20,15 @@ check_required_tools() {
 }
 
 check_az_auth() {
-    local account
-    if ! account=$(az account show 2>/dev/null); then
+    local sub_name sub_id tenant_id user
+    if ! IFS=$'\t' read -r sub_name sub_id tenant_id user < <(
+            az account show --query "[name,id,tenantId,user.name]" -o tsv 2>/dev/null); then
         echo "Error: Azure CLI is not authenticated. Please run 'az login' before proceeding."
         exit 1
     fi
-
-    local subscription_name subscription_id tenant_id user
-    subscription_name=$(echo "$account" | grep -o '"name": "[^"]*"' | head -1 | cut -d'"' -f4)
-    subscription_id=$(echo "$account" | grep -o '"id": "[^"]*"' | head -1 | cut -d'"' -f4)
-    tenant_id=$(echo "$account" | grep -o '"tenantId": "[^"]*"' | cut -d'"' -f4)
-    user=$(echo "$account" | grep -o '"name": "[^"]*"' | tail -1 | cut -d'"' -f4)
-
     echo "[OK] Azure CLI is authenticated"
-    echo "     Subscription : $subscription_name"
-    echo "     Subscription ID: $subscription_id"
+    echo "     Subscription : $sub_name"
+    echo "     Subscription ID: $sub_id"
     echo "     Tenant ID    : $tenant_id"
     echo "     Signed in as : $user"
 }
@@ -83,10 +77,9 @@ generate_cluster_upgrade_scripts() {
 
     # ── Cluster info ────────────────────────────────────────────────────
     local location cp_version
-    location=$(az aks show -n "$cluster_name" -g "$resource_group" \
-        --query location -o tsv 2>/dev/null)
-    cp_version=$(az aks show -n "$cluster_name" -g "$resource_group" \
-        --query kubernetesVersion -o tsv 2>/dev/null)
+    IFS=$'\t' read -r location cp_version < <(
+        az aks show -n "$cluster_name" -g "$resource_group" \
+            --query "[location, kubernetesVersion]" -o tsv 2>/dev/null)
 
     if [[ -z "$location" || -z "$cp_version" ]]; then
         echo "  [ERROR] Could not retrieve cluster info. Skipping."
@@ -94,21 +87,10 @@ generate_cluster_upgrade_scripts() {
     fi
 
     # ── All stable K8s versions in region (used to resolve patch numbers) ──
-    # az aks get-versions lists every published patch version for the region.
-    # Each minor version entry carries an "isPreview" field (true = preview,
-    # null/false = GA). We parse the JSON with Python (bundled with Azure CLI)
-    # to include only patch versions whose parent minor entry is GA.
     local all_region_versions
-    all_region_versions=$(az aks get-versions -l "$location" -o json 2>/dev/null \
-        | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-versions = set()
-for v in data.get('values', []):
-    if not v.get('isPreview'):
-        versions.update(v.get('patchVersions', {}).keys())
-print('\n'.join(sorted(versions, key=lambda x: [int(p) for p in x.split('.')])))
-")
+    all_region_versions=$(az aks get-versions -l "$location" \
+        --query "values[?!isPreview].patchVersions" -o json 2>/dev/null \
+        | grep -oE '"1\.[0-9]+\.[0-9]+"' | tr -d '"' | sort -V)
 
     if [[ -z "$all_region_versions" ]]; then
         echo "  [ERROR] Could not retrieve Kubernetes versions for region $location. Skipping."
@@ -163,11 +145,8 @@ print('\n'.join(sorted(versions, key=lambda x: [int(p) for p in x.split('.')])))
 
     # Return the lowest minor version across all nodepools
     get_min_np_minor() {
-        local min="${np_cur_minors[0]:-$target_minor}"
-        for m in "${np_cur_minors[@]}"; do
-            [[ $m -lt $min ]] && min=$m
-        done
-        echo "$min"
+        [[ ${#np_cur_minors[@]} -eq 0 ]] && echo "$target_minor" && return
+        printf '%s\n' "${np_cur_minors[@]}" | sort -n | head -1
     }
 
     # Write a control-plane upgrade script
@@ -244,13 +223,7 @@ SCRIPT
 #
 # Microsoft best-practice notes:
 #   * The control plane must already be at ${to_version} or higher before running this.
-#   * MAX_SURGE   — extra nodes spun up during upgrade (e.g. 1 or 33%).
-#                   Higher = faster upgrade but more cost. Default: 1.
-#   * MAX_UNAVAILABLE — nodes that may be unavailable simultaneously (e.g. 0 or 25%).
-#                   Must be 0 when MAX_SURGE > 0 (AKS requirement).
-#                   Set >0 only for cost-sensitive pools that tolerate reduced capacity.
-#   * DRAIN_TIMEOUT — how long (minutes) to wait for a node to drain before forcing.
-#                   Default: 30. Increase for workloads with long graceful-termination periods.
+#   * Tune MAX_SURGE, MAX_UNAVAILABLE, DRAIN_TIMEOUT below before executing.
 #   * Verify workload health after each node pool upgrade.
 #
 # Reference: https://learn.microsoft.com/azure/aks/upgrade-aks-cluster#upgrade-node-pools
@@ -262,20 +235,10 @@ NODEPOOL_NAME="${np_name}"
 FROM_VERSION="${from_version}"
 TARGET_VERSION="${to_version}"
 
-# ── Tune these values before running ────────────────────────────────────────
-# MAX_SURGE: extra nodes created during upgrade to maintain capacity.
-# Use an integer (e.g. "1") or a percentage (e.g. "33%").
-MAX_SURGE="1"
-
-# MAX_UNAVAILABLE: nodes allowed to be unavailable at the same time.
-# Must be "0" when MAX_SURGE is non-zero (AKS enforces this constraint).
-# Set to a value > 0 only when MAX_SURGE="0" and reduced capacity is acceptable.
-MAX_UNAVAILABLE="0"
-
-# DRAIN_TIMEOUT: minutes to wait for pods to drain from a node before forcing.
-# Increase this for workloads with long PodDisruptionBudgets or slow shutdown hooks.
-DRAIN_TIMEOUT=30
-# ─────────────────────────────────────────────────────────────────────────────
+# Tune these before running:
+MAX_SURGE="1"          # extra nodes during upgrade: integer or % (e.g. "1" or "33%")
+MAX_UNAVAILABLE="0"    # must be "0" when MAX_SURGE > 0 (AKS requirement)
+DRAIN_TIMEOUT=30       # minutes to wait for pod drain before forcing
 
 echo "==> [Step ${step_num}] Upgrading nodepool '\${NODEPOOL_NAME}' of \${CLUSTER_NAME}: \${FROM_VERSION}  →  \${TARGET_VERSION}"
 echo "    max-surge=\${MAX_SURGE}  max-unavailable=\${MAX_UNAVAILABLE}  drain-timeout=\${DRAIN_TIMEOUT}m"
@@ -315,14 +278,9 @@ SCRIPT
 # Cluster       : ${cluster_name}
 # Resource Group: ${resource_group}
 #
-# Purpose:
-#   Scan the cluster for resources that use APIs deprecated or removed in
-#   the Kubernetes versions you are upgrading to.  Fix any findings BEFORE
-#   running the control-plane upgrade scripts.
-#
-# Prerequisites:
-#   kubent must be installed: https://github.com/doitintl/kube-no-trouble
-#   kubectl must be configured to point at the target cluster.
+# Scans for deprecated/removed Kubernetes APIs. Fix any findings BEFORE upgrading.
+# Prerequisites: kubent (https://github.com/doitintl/kube-no-trouble) and kubectl
+#   configured to point at this cluster.
 #
 # Reference: https://learn.microsoft.com/azure/aks/upgrade-aks-cluster#check-for-removed-apis
 set -euo pipefail
