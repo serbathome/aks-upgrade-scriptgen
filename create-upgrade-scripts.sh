@@ -20,12 +20,13 @@ check_required_tools() {
 }
 
 check_az_auth() {
-    local sub_name sub_id tenant_id user
-    if ! IFS=$'\t' read -r sub_name sub_id tenant_id user < <(
-            az account show --query "[name,id,tenantId,user.name]" -o tsv 2>/dev/null); then
+    local out
+    if ! out=$(az account show --query "[name,id,tenantId,user.name]" -o tsv 2>/dev/null); then
         echo "Error: Azure CLI is not authenticated. Please run 'az login' before proceeding."
         exit 1
     fi
+    local sub_name sub_id tenant_id user
+    { read -r sub_name; read -r sub_id; read -r tenant_id; read -r user; } <<< "$out"
     echo "[OK] Azure CLI is authenticated"
     echo "     Subscription : $sub_name"
     echo "     Subscription ID: $sub_id"
@@ -76,10 +77,13 @@ generate_cluster_upgrade_scripts() {
     echo "══════════════════════════════════════════════════════════════"
 
     # ── Cluster info ────────────────────────────────────────────────────
-    local location cp_version
-    IFS=$'\t' read -r location cp_version < <(
-        az aks show -n "$cluster_name" -g "$resource_group" \
-            --query "[location, kubernetesVersion]" -o tsv 2>/dev/null)
+    local location cp_version info
+    if ! info=$(az aks show -n "$cluster_name" -g "$resource_group" \
+            --query "[location, kubernetesVersion]" -o tsv 2>/dev/null); then
+        echo "  [ERROR] Could not retrieve cluster info. Skipping."
+        return 1
+    fi
+    { read -r location; read -r cp_version; } <<< "$info"
 
     if [[ -z "$location" || -z "$cp_version" ]]; then
         echo "  [ERROR] Could not retrieve cluster info. Skipping."
