@@ -58,6 +58,184 @@ list_aks_clusters() {
 }
 
 # ---------------------------------------------------------------------------
+# check_quota_for_cluster <cluster_name> <resource_group> <location>
+#
+# For every nodepool in the cluster, calculates the number of extra (surge)
+# VMs required during an AKS upgrade, maps each to its Azure VM family, and
+# checks available vCPU quota in the region.
+#
+# Returns 0 if all quota checks pass, 1 if any family or the regional total
+# would be exceeded.
+# ---------------------------------------------------------------------------
+check_quota_for_cluster() {
+    local cluster_name="$1"
+    local resource_group="$2"
+    local location="$3"
+
+    echo ""
+    echo "══════════════════════════════════════════════════════════════"
+    echo " Quota check: $cluster_name  ($resource_group)  —  $location"
+    echo "══════════════════════════════════════════════════════════════"
+
+    # ── 1. Fetch nodepool details ────────────────────────────────────────
+    local nodepools_raw
+    nodepools_raw=$(az aks nodepool list \
+        --cluster-name "$cluster_name" --resource-group "$resource_group" \
+        --query "[].{name:name, vmSize:vmSize, count:count, maxSurge:upgradeSettings.maxSurge}" \
+        -o tsv 2>/dev/null)
+
+    if [[ -z "$nodepools_raw" ]]; then
+        echo "  [WARN] Could not retrieve nodepools for quota check. Skipping quota validation."
+        return 0
+    fi
+
+    # ── 2. Per-SKU caches (avoid repeated az calls for the same size) ────
+    declare -A sku_vcpus=()
+    declare -A sku_family=()
+
+    # ── 3. Fetch all quota entries for this location (one call) ──────────
+    local quota_raw
+    quota_raw=$(az vm list-usage --location "$location" \
+        --query "[].{key:name.value, used:currentValue, limit:limit, display:name.localizedValue}" \
+        -o tsv 2>/dev/null)
+
+    if [[ -z "$quota_raw" ]]; then
+        echo "  [WARN] Could not retrieve VM quota for location '$location'. Skipping quota validation."
+        return 0
+    fi
+
+    declare -A quota_used=()
+    declare -A quota_limit=()
+    declare -A quota_display=()
+    while IFS=$'\t' read -r q_key q_used q_limit q_display; do
+        [[ -z "$q_key" ]] && continue
+        quota_used["$q_key"]=$q_used
+        quota_limit["$q_key"]=$q_limit
+        quota_display["$q_key"]=$q_display
+    done <<< "$quota_raw"
+
+    # ── 4. Parse nodepools, resolve SKU info, accumulate extra vCPUs ─────
+    declare -A extra_vcpus_per_family=()
+    local total_extra_vcpus=0
+    local np_rows=()    # for the formatted table
+    local quota_ok=0
+
+    # Table header
+    printf "\n  %-20s %-22s %6s %6s %6s %10s\n" \
+        "NODEPOOL" "VM SIZE" "NODES" "SURGE" "CPU/VM" "EXTRA CPUs"
+    printf "  %s\n" "─────────────────────────────────────────────────────────────────────"
+
+    while IFS=$'\t' read -r np_name vm_size node_count max_surge; do
+        [[ -z "$np_name" ]] && continue
+
+        # Resolve surge count
+        local surge_count
+        if [[ -z "$max_surge" || "$max_surge" == "null" ]]; then
+            surge_count=1
+        elif [[ "$max_surge" =~ ^([0-9]+)%$ ]]; then
+            local pct="${BASH_REMATCH[1]}"
+            surge_count=$(( (node_count * pct + 99) / 100 ))
+            [[ $surge_count -lt 1 ]] && surge_count=1
+        elif [[ "$max_surge" =~ ^[0-9]+$ ]]; then
+            surge_count=$max_surge
+            [[ $surge_count -lt 0 ]] && surge_count=0
+        else
+            surge_count=1
+        fi
+
+        # Resolve vCPUs and family (cached)
+        if [[ -z "${sku_vcpus[$vm_size]+x}" ]]; then
+            # Two separate scalar queries avoid TSV multi-value line-order ambiguity.
+            # --size does prefix filtering; the JMESPath [?name==…] guard ensures
+            # an exact match so we don't pick up e.g. Standard_D8s_v32.
+            local s_family s_vcpus
+            s_family=$(az vm list-skus \
+                --location "$location" \
+                --resource-type virtualMachines \
+                --size "$vm_size" \
+                --query "[?name=='$vm_size'] | [0].family" \
+                -o tsv 2>/dev/null)
+            s_vcpus=$(az vm list-skus \
+                --location "$location" \
+                --resource-type virtualMachines \
+                --size "$vm_size" \
+                --query "[?name=='$vm_size'] | [0].capabilities | [?name=='vCPUs'] | [0].value" \
+                -o tsv 2>/dev/null)
+            if [[ -n "$s_family" && "$s_family" != "None" && -n "$s_vcpus" && "$s_vcpus" != "None" ]]; then
+                sku_family["$vm_size"]="$s_family"
+                sku_vcpus["$vm_size"]="$s_vcpus"
+            else
+                sku_family["$vm_size"]="UNKNOWN"
+                sku_vcpus["$vm_size"]="0"
+            fi
+        fi
+
+        local vcpus_per_vm="${sku_vcpus[$vm_size]}"
+        local vm_family="${sku_family[$vm_size]}"
+        local extra_vcpus=$(( surge_count * vcpus_per_vm ))
+
+        # Accumulate
+        extra_vcpus_per_family["$vm_family"]=$(( ${extra_vcpus_per_family["$vm_family"]:-0} + extra_vcpus ))
+        total_extra_vcpus=$(( total_extra_vcpus + extra_vcpus ))
+
+        printf "  %-20s %-22s %6s %6s %6s %10s\n" \
+            "$np_name" "$vm_size" "$node_count" "$surge_count" "$vcpus_per_vm" "$extra_vcpus"
+
+    done <<< "$nodepools_raw"
+
+    # ── 5. Check per-family and regional quota ────────────────────────────
+    echo ""
+    echo "  VM FAMILY / REGIONAL QUOTA:"
+    printf "  %-38s %7s %7s %7s %9s  %s\n" \
+        "FAMILY" "EXTRA" "USED" "LIMIT" "HEADROOM" "STATUS"
+    printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────"
+
+    for family in "${!extra_vcpus_per_family[@]}"; do
+        local extra="${extra_vcpus_per_family[$family]}"
+        local used="${quota_used[$family]:-}"
+        local limit="${quota_limit[$family]:-}"
+        local display="${quota_display[$family]:-$family}"
+
+        if [[ -z "$used" || -z "$limit" ]]; then
+            printf "  %-38s %7s %7s %7s %9s  %s\n" \
+                "$display" "$extra" "?" "?" "?" "[WARN: quota not found]"
+            continue
+        fi
+
+        local headroom=$(( limit - used ))
+        local status
+        if [[ $extra -le $headroom ]]; then
+            status="[OK]"
+        else
+            status="[INSUFFICIENT]"
+            quota_ok=1
+        fi
+
+        printf "  %-38s %7s %7s %7s %9s  %s\n" \
+            "$display" "$extra" "$used" "$limit" "$headroom" "$status"
+    done
+
+    # Regional total vCPUs
+    local reg_used="${quota_used[cores]:-}"
+    local reg_limit="${quota_limit[cores]:-}"
+    if [[ -n "$reg_used" && -n "$reg_limit" ]]; then
+        local reg_headroom=$(( reg_limit - reg_used ))
+        local reg_status
+        if [[ $total_extra_vcpus -le $reg_headroom ]]; then
+            reg_status="[OK]"
+        else
+            reg_status="[INSUFFICIENT]"
+            quota_ok=1
+        fi
+        printf "  %-38s %7s %7s %7s %9s  %s\n" \
+            "Total Regional vCPUs" "$total_extra_vcpus" "$reg_used" "$reg_limit" "$reg_headroom" "$reg_status"
+    fi
+
+    echo ""
+    return $quota_ok
+}
+
+# ---------------------------------------------------------------------------
 # generate_cluster_upgrade_scripts <cluster_name> <resource_group>
 #
 # Builds numbered shell scripts in ./<cluster_name>/ that upgrade the AKS
@@ -87,6 +265,12 @@ generate_cluster_upgrade_scripts() {
 
     if [[ -z "$location" || -z "$cp_version" ]]; then
         echo "  [ERROR] Could not retrieve cluster info. Skipping."
+        return 1
+    fi
+
+    # ── Quota pre-flight check ───────────────────────────────────────────
+    if ! check_quota_for_cluster "$cluster_name" "$resource_group" "$location"; then
+        echo "  [SKIP] Upgrade scripts NOT generated for $cluster_name due to insufficient VM quota."
         return 1
     fi
 
