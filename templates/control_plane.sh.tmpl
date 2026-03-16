@@ -1,0 +1,37 @@
+#!/bin/bash
+# Step {{.Step}} — Upgrade AKS control plane: {{.FromVersion}}  →  {{.ToVersion}}
+#
+# Cluster       : {{.ClusterName}}
+# Resource Group: {{.ResourceGroup}}
+#
+# Microsoft best-practice notes:
+#   * The control plane is upgraded independently of node pools (--control-plane-only).
+#   * Only one minor version is crossed per script.
+#   * Verify cluster health before running the next step.
+#
+# Reference: https://learn.microsoft.com/azure/aks/upgrade-aks-cluster
+set -euo pipefail
+
+CLUSTER_NAME="{{.ClusterName}}"
+RESOURCE_GROUP="{{.ResourceGroup}}"
+FROM_VERSION="{{.FromVersion}}"
+TARGET_VERSION="{{.ToVersion}}"
+
+echo "==> [Step {{.Step}}] Upgrading control plane of ${CLUSTER_NAME}: ${FROM_VERSION}  →  ${TARGET_VERSION}"
+
+echo "--- Pre-upgrade cluster state:"
+az aks show \
+    --name "${CLUSTER_NAME}" \
+    --resource-group "${RESOURCE_GROUP}" \
+    --query "{provisioningState:provisioningState,currentVersion:kubernetesVersion}" \
+    -o table
+
+echo "--- Starting control plane upgrade (node pools are NOT touched)..."
+az aks upgrade \
+    --name "${CLUSTER_NAME}" \
+    --resource-group "${RESOURCE_GROUP}" \
+    --kubernetes-version "${TARGET_VERSION}" \
+    --control-plane-only \
+    --yes
+
+echo "==> Control plane successfully upgraded: ${FROM_VERSION}  →  ${TARGET_VERSION}."
