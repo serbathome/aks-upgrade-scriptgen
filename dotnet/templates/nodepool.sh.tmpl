@@ -1,0 +1,49 @@
+# Script: {{Step}}_upgrade_{{NodepoolName}}_{{FromVersion}}_to_{{ToVersion}}.sh
+#!/bin/bash
+# Step {{Step}} — Upgrade nodepool '{{NodepoolName}}': {{FromVersion}}  →  {{ToVersion}}
+#
+# Cluster       : {{ClusterName}}
+# Resource Group: {{ResourceGroup}}
+#
+# Microsoft best-practice notes:
+#   * The control plane must already be at {{ToVersion}} or higher before running this.
+#   * Tune MAX_SURGE, MAX_UNAVAILABLE, DRAIN_TIMEOUT below before executing.
+#   * Verify workload health after each node pool upgrade.
+#
+# Reference: https://learn.microsoft.com/azure/aks/upgrade-aks-cluster#upgrade-node-pools
+set -euo pipefail
+
+CLUSTER_NAME="{{ClusterName}}"
+RESOURCE_GROUP="{{ResourceGroup}}"
+NODEPOOL_NAME="{{NodepoolName}}"
+FROM_VERSION="{{FromVersion}}"
+TARGET_VERSION="{{ToVersion}}"
+
+# Tune these before running:
+MAX_SURGE="1"          # extra nodes during upgrade: integer or % (e.g. "1" or "33%")
+MAX_UNAVAILABLE="0"    # must be "0" when MAX_SURGE > 0 (AKS requirement)
+DRAIN_TIMEOUT=30       # minutes to wait for pod drain before forcing
+
+echo "==> [Step {{Step}}] Upgrading nodepool '${NODEPOOL_NAME}' of ${CLUSTER_NAME}: ${FROM_VERSION}  →  ${TARGET_VERSION}"
+echo "    max-surge=${MAX_SURGE}  max-unavailable=${MAX_UNAVAILABLE}  drain-timeout=${DRAIN_TIMEOUT}m"
+
+echo "--- Pre-upgrade nodepool state:"
+az aks nodepool show \
+    --cluster-name "${CLUSTER_NAME}" \
+    --resource-group "${RESOURCE_GROUP}" \
+    --name "${NODEPOOL_NAME}" \
+    --query "{provisioningState:provisioningState,currentVersion:orchestratorVersion,count:count}" \
+    -o table
+
+echo "--- Starting nodepool upgrade..."
+az aks nodepool upgrade \
+    --cluster-name "${CLUSTER_NAME}" \
+    --resource-group "${RESOURCE_GROUP}" \
+    --name "${NODEPOOL_NAME}" \
+    --kubernetes-version "${TARGET_VERSION}" \
+    --max-surge "${MAX_SURGE}" \
+    --max-unavailable "${MAX_UNAVAILABLE}" \
+    --drain-timeout "${DRAIN_TIMEOUT}" \
+    --yes
+
+echo "==> Nodepool '${NODEPOOL_NAME}' successfully upgraded: ${FROM_VERSION}  →  ${TARGET_VERSION}."
