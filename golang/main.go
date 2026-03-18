@@ -24,6 +24,7 @@ import (
 	"log"
 	"maps"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -38,6 +39,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armsubscriptions"
 )
 
@@ -102,6 +104,8 @@ type nodepoolInfo struct {
 	nodeCount int32
 	maxSurge  string // raw: "", "1", "33%", etc.
 	curMinor  int
+	subnetID  string // VNet subnet resource ID; empty if AKS-managed VNet
+	maxPods   int32  // max pods per node (default 30 for Azure CNI legacy)
 }
 
 // surgeCount resolves the integer number of extra (surge) nodes for an upgrade.
@@ -157,10 +161,11 @@ type clusterRef struct {
 // ---------------------------------------------------------------------------
 
 type clients struct {
-	aks   *armcontainerservice.ManagedClustersClient
-	pools *armcontainerservice.AgentPoolsClient
-	skus  *armcompute.ResourceSKUsClient
-	usage *armcompute.UsageClient
+	aks     *armcontainerservice.ManagedClustersClient
+	pools   *armcontainerservice.AgentPoolsClient
+	skus    *armcompute.ResourceSKUsClient
+	usage   *armcompute.UsageClient
+	subnets *armnetwork.SubnetsClient
 }
 
 func newClients(subID string, cred azcore.TokenCredential) (*clients, error) {
@@ -181,7 +186,11 @@ func newClients(subID string, cred azcore.TokenCredential) (*clients, error) {
 	if err != nil {
 		return nil, fmt.Errorf("usage client: %w", err)
 	}
-	return &clients{aks: aks, pools: pools, skus: skus, usage: usage}, nil
+	subnets, err := armnetwork.NewSubnetsClient(subID, cred, opts)
+	if err != nil {
+		return nil, fmt.Errorf("subnets client: %w", err)
+	}
+	return &clients{aks: aks, pools: pools, skus: skus, usage: usage, subnets: subnets}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -325,20 +334,48 @@ func generateClusterScripts(
 			if np.Properties.Count != nil {
 				count = *np.Properties.Count
 			}
+			subnetID := ""
+			if np.Properties.VnetSubnetID != nil {
+				subnetID = *np.Properties.VnetSubnetID
+			}
+			maxPods := int32(30) // Azure CNI legacy default
+			if np.Properties.MaxPods != nil {
+				maxPods = *np.Properties.MaxPods
+			}
 			nodepools = append(nodepools, nodepoolInfo{
 				name:      ptrStr(np.Name),
 				vmSize:    ptrStr(np.Properties.VMSize),
 				nodeCount: count,
 				maxSurge:  surge,
 				curMinor:  parsed.minor,
+				subnetID:  subnetID,
+				maxPods:   maxPods,
 			})
 			fmt.Printf("  Nodepool      : %s @ %s\n", ptrStr(np.Name), ver)
 		}
 	}
 
+	// ----- Fetch full cluster to read network profile -------------------
+	clusterResp, clusterErr := c.aks.Get(ctx, rg, clusterName, nil)
+	var networkPlugin armcontainerservice.NetworkPlugin
+	var networkPluginMode *armcontainerservice.NetworkPluginMode
+	if clusterErr == nil && clusterResp.Properties != nil && clusterResp.Properties.NetworkProfile != nil {
+		if clusterResp.Properties.NetworkProfile.NetworkPlugin != nil {
+			networkPlugin = *clusterResp.Properties.NetworkProfile.NetworkPlugin
+		}
+		networkPluginMode = clusterResp.Properties.NetworkProfile.NetworkPluginMode
+	}
+
 	// ----- Quota pre-flight ----------------------------------------------
 	if !checkQuota(ctx, clusterName, rg, location, nodepools, c.skus, c.usage) {
 		fmt.Printf("  [SKIP] Upgrade scripts NOT generated for %s due to insufficient VM quota.\n",
+			clusterName)
+		return
+	}
+
+	// ----- Subnet IP pre-flight ------------------------------------------
+	if !checkSubnetIPs(ctx, clusterName, rg, nodepools, networkPlugin, networkPluginMode, c.subnets) {
+		fmt.Printf("  [SKIP] Upgrade scripts NOT generated for %s due to insufficient subnet IPs.\n",
 			clusterName)
 		return
 	}
@@ -623,6 +660,178 @@ func checkQuota(
 		}
 		fmt.Printf("  %-38s %7d %7d %7d %9d  %s\n",
 			"Total Regional vCPUs", totalExtra, reg.used, reg.limit, headroom, status)
+	}
+
+	fmt.Println()
+	return allOK
+}
+
+// ---------------------------------------------------------------------------
+// checkSubnetIPs — validates that the VNet subnet(s) have enough free IPs
+// to accommodate the surge nodes needed for the upgrade.
+// ---------------------------------------------------------------------------
+
+// parseSubnetResourceID extracts (resourceGroup, vnetName, subnetName) from an
+// ARM subnet resource ID of the form:
+//
+//	/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/virtualNetworks/{vnet}/subnets/{subnet}
+func parseSubnetResourceID(id string) (rg, vnet, subnet string, ok bool) {
+	parts := strings.Split(id, "/")
+	// Minimum length: ["", "subscriptions", sub, "resourceGroups", rg,
+	//                  "providers", "Microsoft.Network", "virtualNetworks", vnet,
+	//                  "subnets", subnet] == 11 elements
+	if len(parts) < 11 {
+		return "", "", "", false
+	}
+	for i, p := range parts {
+		switch strings.ToLower(p) {
+		case "resourcegroups":
+			if i+1 < len(parts) {
+				rg = parts[i+1]
+			}
+		case "virtualnetworks":
+			if i+1 < len(parts) {
+				vnet = parts[i+1]
+			}
+		case "subnets":
+			if i+1 < len(parts) {
+				subnet = parts[i+1]
+			}
+		}
+	}
+	ok = rg != "" && vnet != "" && subnet != ""
+	return
+}
+
+func checkSubnetIPs(
+	ctx context.Context,
+	clusterName, rg string,
+	nodepools []nodepoolInfo,
+	networkPlugin armcontainerservice.NetworkPlugin,
+	networkPluginMode *armcontainerservice.NetworkPluginMode,
+	subnetsClient *armnetwork.SubnetsClient,
+) bool {
+	sep := strings.Repeat("═", 62)
+	fmt.Printf("\n%s\n Subnet IP check: %s  (%s)\n%s\n", sep, clusterName, rg, sep)
+
+	// Determine how many VNet IPs each surge node consumes.
+	// - Azure CNI Overlay: pods use a private CIDR overlay → only 1 IP per node
+	// - kubenet: pods use a private CIDR overlay → only 1 IP per node
+	// - Azure CNI (legacy): each pod slot reserves a VNet IP → 1 + maxPods per node
+	isOverlay := networkPluginMode != nil &&
+		*networkPluginMode == armcontainerservice.NetworkPluginModeOverlay
+
+	ipsPerSurgeNode := func(np nodepoolInfo) int64 {
+		if networkPlugin == armcontainerservice.NetworkPluginAzure && !isOverlay {
+			return 1 + int64(np.maxPods)
+		}
+		return 1
+	}
+
+	// Check whether any nodepool has a custom subnet set.
+	hasSubnet := false
+	for _, np := range nodepools {
+		if np.subnetID != "" {
+			hasSubnet = true
+			break
+		}
+	}
+	if !hasSubnet {
+		fmt.Println("  [INFO] No custom VNet subnet configured; skipping subnet IP check.")
+		return true
+	}
+
+	// Group nodepools by subnet ID to aggregate demand per subnet.
+	type npDemand struct {
+		np          nodepoolInfo
+		ipsPerSurge int64
+		ipsNeeded   int64
+	}
+	subnetDemand := make(map[string][]npDemand) // subnetID → demands
+	for _, np := range nodepools {
+		if np.subnetID == "" {
+			continue
+		}
+		ips := ipsPerSurgeNode(np)
+		subnetDemand[np.subnetID] = append(subnetDemand[np.subnetID], npDemand{
+			np:          np,
+			ipsPerSurge: ips,
+			ipsNeeded:   int64(np.surgeCount()) * ips,
+		})
+	}
+
+	// Print per-nodepool table.
+	fmt.Printf("\n  %-20s %-10s %-12s %10s\n", "NODEPOOL", "SURGE", "IPs/NODE", "TOTAL IPs")
+	fmt.Printf("  %s\n", strings.Repeat("─", 55))
+	for _, demands := range subnetDemand {
+		for _, d := range demands {
+			fmt.Printf("  %-20s %6d %12d %10d\n",
+				d.np.name, d.np.surgeCount(), d.ipsPerSurge, d.ipsNeeded)
+		}
+	}
+
+	// Check availability per subnet.
+	fmt.Printf("\n  SUBNET AVAILABILITY:\n")
+	fmt.Printf("  %-44s %7s %7s %7s %7s  %s\n",
+		"SUBNET CIDR", "NEEDED", "USED", "TOTAL", "AVAIL", "STATUS")
+	fmt.Printf("  %s\n", strings.Repeat("─", 82))
+
+	allOK := true
+	subnetIDs := slices.Sorted(maps.Keys(subnetDemand))
+
+	for _, subnetID := range subnetIDs {
+		demands := subnetDemand[subnetID]
+
+		// Sum total IPs needed across all nodepools in this subnet.
+		totalNeeded := int64(0)
+		for _, d := range demands {
+			totalNeeded += d.ipsNeeded
+		}
+
+		subRG, vnetName, subnetName, ok := parseSubnetResourceID(subnetID)
+		if !ok {
+			fmt.Printf("  %-44s %7d %7s %7s %7s  [WARN: cannot parse subnet ID]\n",
+				subnetID, totalNeeded, "?", "?", "?")
+			continue
+		}
+
+		expandParam := "ipConfigurations"
+		resp, err := subnetsClient.Get(ctx, subRG, vnetName, subnetName,
+			&armnetwork.SubnetsClientGetOptions{Expand: &expandParam})
+		if err != nil {
+			fmt.Printf("  %-44s %7d %7s %7s %7s  [WARN: %v]\n",
+				subnetName, totalNeeded, "?", "?", "?", err)
+			// Non-fatal: don't block script generation.
+			continue
+		}
+
+		// Determine CIDR label and total IPs.
+		cidr := ""
+		totalIPs := int64(0)
+		if resp.Properties != nil && resp.Properties.AddressPrefix != nil {
+			cidr = *resp.Properties.AddressPrefix
+			_, ipNet, parseErr := net.ParseCIDR(cidr)
+			if parseErr == nil {
+				ones, bits := ipNet.Mask.Size()
+				totalIPs = (int64(1) << (bits - ones)) - 5 // Azure reserves 5 per subnet
+			}
+		}
+		if cidr == "" {
+			cidr = subnetName
+		}
+
+		usedIPs := int64(0)
+		if resp.Properties != nil {
+			usedIPs = int64(len(resp.Properties.IPConfigurations))
+		}
+		availIPs := totalIPs - usedIPs
+		status := "[OK]"
+		if totalNeeded > availIPs {
+			status = "[INSUFFICIENT]"
+			allOK = false
+		}
+		fmt.Printf("  %-44s %7d %7d %7d %7d  %s\n",
+			cidr, totalNeeded, usedIPs, totalIPs, availIPs, status)
 	}
 
 	fmt.Println()

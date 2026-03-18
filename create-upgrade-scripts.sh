@@ -236,6 +236,180 @@ check_quota_for_cluster() {
 }
 
 # ---------------------------------------------------------------------------
+# check_subnet_ips_for_cluster <cluster_name> <resource_group>
+#
+# For every nodepool that is integrated with a custom VNet subnet, calculates
+# the number of additional IPs consumed in that subnet by the surge nodes
+# created during an AKS upgrade and compares it against the subnet's current
+# available address space.
+#
+# IP-per-surge-node accounting by network plugin:
+#   Azure CNI (legacy/flat): 1 (node) + maxPods (pre-allocated pod IPs)
+#   Azure CNI Overlay / kubenet: 1 (node only; pods use an overlay CIDR)
+#
+# Returns 0 if all subnets have sufficient IPs, 1 if any would be exceeded.
+# ---------------------------------------------------------------------------
+check_subnet_ips_for_cluster() {
+    local cluster_name="$1"
+    local resource_group="$2"
+
+    echo ""
+    echo "══════════════════════════════════════════════════════════════"
+    echo " Subnet IP check: $cluster_name  ($resource_group)"
+    echo "══════════════════════════════════════════════════════════════"
+
+    # ── 1. Detect network plugin to determine IPs consumed per surge node ──
+    local net_plugin net_plugin_mode
+    local net_info
+    net_info=$(az aks show \
+        --name "$cluster_name" --resource-group "$resource_group" \
+        --query "networkProfile.{plugin:networkPlugin, pluginMode:networkPluginMode}" \
+        -o tsv 2>/dev/null)
+
+    if [[ -z "$net_info" ]]; then
+        echo "  [WARN] Could not retrieve network profile. Skipping subnet IP check."
+        return 0
+    fi
+    { read -r net_plugin; read -r net_plugin_mode; } <<< "$net_info"
+
+    # flat CNI: each surge node consumes 1 + maxPods IPs from the subnet
+    # overlay / kubenet: each surge node consumes only 1 IP
+    local flat_cni=0
+    if [[ "$net_plugin" == "azure" && "$net_plugin_mode" != "overlay" ]]; then
+        flat_cni=1
+    fi
+
+    # ── 2. Fetch nodepool data ───────────────────────────────────────────
+    local nodepools_raw
+    nodepools_raw=$(az aks nodepool list \
+        --cluster-name "$cluster_name" --resource-group "$resource_group" \
+        --query "[].{name:name, subnetId:vnetSubnetId, count:count, maxPods:maxPods, maxSurge:upgradeSettings.maxSurge}" \
+        -o tsv 2>/dev/null)
+
+    if [[ -z "$nodepools_raw" ]]; then
+        echo "  [WARN] Could not retrieve nodepools for subnet IP check. Skipping."
+        return 0
+    fi
+
+    # ── 3. Accumulate required IPs per unique subnet ─────────────────────
+    declare -A subnet_required=()   # subnet_id -> total IPs needed across pools
+    declare -A subnet_short_name=() # subnet_id -> human-readable name
+
+    while IFS=$'\t' read -r np_name subnet_id node_count max_pods max_surge; do
+        [[ -z "$np_name" ]] && continue
+
+        # Nodepools without a custom subnet ID are in AKS-managed networking;
+        # not bounded by a user subnet so we skip them.
+        if [[ -z "$subnet_id" || "$subnet_id" == "None" || "$subnet_id" == "null" ]]; then
+            echo "  [INFO] Nodepool '$np_name': no custom subnet — skipping."
+            continue
+        fi
+
+        # Resolve surge count (same logic as quota check)
+        local surge_count
+        if [[ -z "$max_surge" || "$max_surge" == "null" || "$max_surge" == "None" ]]; then
+            surge_count=1
+        elif [[ "$max_surge" =~ ^([0-9]+)%$ ]]; then
+            local pct="${BASH_REMATCH[1]}"
+            surge_count=$(( (node_count * pct + 99) / 100 ))
+            [[ $surge_count -lt 1 ]] && surge_count=1
+        elif [[ "$max_surge" =~ ^[0-9]+$ ]]; then
+            surge_count=$max_surge
+            [[ $surge_count -lt 0 ]] && surge_count=0
+        else
+            surge_count=1
+        fi
+
+        # IPs required per surge node
+        local ips_per_surge
+        if [[ $flat_cni -eq 1 ]]; then
+            local mp=${max_pods:-30}
+            [[ "$mp" == "None" || "$mp" == "null" ]] && mp=30
+            ips_per_surge=$(( 1 + mp ))
+        else
+            ips_per_surge=1
+        fi
+
+        local np_required=$(( surge_count * ips_per_surge ))
+        subnet_required["$subnet_id"]=$(( ${subnet_required["$subnet_id"]:-0} + np_required ))
+        # Derive a short name from the last two path segments (vnet/subnet)
+        local short
+        short=$(echo "$subnet_id" | rev | cut -d'/' -f1-3 | rev)
+        subnet_short_name["$subnet_id"]="$short"
+
+    done <<< "$nodepools_raw"
+
+    if [[ ${#subnet_required[@]} -eq 0 ]]; then
+        echo "  [INFO] No custom-VNet nodepools found. Skipping subnet IP check."
+        return 0
+    fi
+
+    # ── 4. Check each unique subnet ──────────────────────────────────────
+    printf "\n  %-50s %8s %6s %7s %6s  %s\n" \
+        "SUBNET" "REQUIRED" "USED" "USABLE" "AVAIL" "STATUS"
+    printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────"
+
+    local subnet_ok=0
+
+    for subnet_id in "${!subnet_required[@]}"; do
+        local required="${subnet_required[$subnet_id]}"
+        local display="${subnet_short_name[$subnet_id]}"
+
+        # Fetch subnet details in one call
+        local subnet_json
+        subnet_json=$(az network vnet subnet show --ids "$subnet_id" \
+            --query "{prefix:addressPrefix, prefixes:addressPrefixes, usedCount:length(ipConfigurations)}" \
+            -o json 2>/dev/null)
+
+        if [[ -z "$subnet_json" ]]; then
+            printf "  %-50s %8s %6s %7s %6s  %s\n" \
+                "$display" "$required" "?" "?" "?" "[WARN: subnet not found]"
+            continue
+        fi
+
+        # Parse CIDR prefix — prefer addressPrefix, fall back to addressPrefixes[0]
+        local cidr
+        cidr=$(echo "$subnet_json" | grep -oP '"prefix"\s*:\s*"\K[^"]+' | head -1)
+        if [[ -z "$cidr" || "$cidr" == "null" ]]; then
+            cidr=$(echo "$subnet_json" | grep -oP '"prefixes"\s*:\s*\[\s*"\K[^"]+' | head -1)
+        fi
+
+        if [[ -z "$cidr" || "$cidr" == "null" ]]; then
+            printf "  %-50s %8s %6s %7s %6s  %s\n" \
+                "$display" "$required" "?" "?" "?" "[WARN: CIDR not found]"
+            continue
+        fi
+
+        # Calculate usable addresses: 2^(32-prefixlen) - 5 (Azure reserves 5 per subnet)
+        local prefix_len
+        prefix_len=$(echo "$cidr" | cut -d'/' -f2)
+        local total_ips=$(( 1 << (32 - prefix_len) ))
+        local usable=$(( total_ips - 5 ))
+        [[ $usable -lt 0 ]] && usable=0
+
+        # Parse currently used IP count from ipConfigurations length
+        local used
+        used=$(echo "$subnet_json" | grep -oP '"usedCount"\s*:\s*\K[0-9]+')
+        [[ -z "$used" ]] && used=0
+
+        local available=$(( usable - used ))
+        local status
+        if [[ $required -le $available ]]; then
+            status="[OK]"
+        else
+            status="[INSUFFICIENT]"
+            subnet_ok=1
+        fi
+
+        printf "  %-50s %8s %6s %7s %6s  %s\n" \
+            "$display" "$required" "$used" "$usable" "$available" "$status"
+    done
+
+    echo ""
+    return $subnet_ok
+}
+
+# ---------------------------------------------------------------------------
 # generate_cluster_upgrade_scripts <cluster_name> <resource_group>
 #
 # Builds numbered shell scripts in ./<cluster_name>/ that upgrade the AKS
@@ -271,6 +445,12 @@ generate_cluster_upgrade_scripts() {
     # ── Quota pre-flight check ───────────────────────────────────────────
     if ! check_quota_for_cluster "$cluster_name" "$resource_group" "$location"; then
         echo "  [SKIP] Upgrade scripts NOT generated for $cluster_name due to insufficient VM quota."
+        return 1
+    fi
+
+    # ── VNet subnet IP pre-flight check ─────────────────────────────────
+    if ! check_subnet_ips_for_cluster "$cluster_name" "$resource_group"; then
+        echo "  [SKIP] Upgrade scripts NOT generated for $cluster_name due to insufficient subnet IPs."
         return 1
     fi
 
