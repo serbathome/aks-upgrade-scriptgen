@@ -1,8 +1,10 @@
-﻿using Azure.Identity;
+﻿using Azure.Core;
+using Azure.Identity;
 using Azure.ResourceManager;
 using Azure.ResourceManager.Compute;
 using Azure.ResourceManager.ContainerService;
 using Azure.ResourceManager.ContainerService.Models;
+using Azure.ResourceManager.Network;
 using Azure.ResourceManager.Resources;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -78,12 +80,16 @@ await foreach (var cluster in subscription.GetContainerServiceManagedClustersAsy
                 pMin = curMinor; pv = currentVersion;
             }
             pools.Add(new PoolInfo(pool.Data.Name!, pv, pMin,
-                pool.Data.Count ?? 1, pool.Data.VmSize ?? "", pool.Data.UpgradeSettings?.MaxSurge));
+                pool.Data.Count ?? 1, pool.Data.VmSize ?? "", pool.Data.UpgradeSettings?.MaxSurge,
+                pool.Data.VnetSubnetId?.ToString(), pool.Data.MaxPods ?? 30));
         }
     }
     catch (Exception ex) { Console.WriteLine($"WARN [{clusterName}]: Failed to list node pools: {ex.Message}, skipping."); continue; }
 
     if (!await CheckQuota(subscription, location, pools, clusterName, bestPatch, targetMinor))
+        continue;
+
+    if (!await CheckSubnetIpAvailability(armClient, cluster, pools, clusterName))
         continue;
 
     var clusterDir = Path.Combine(outRoot, clusterName);
@@ -185,7 +191,7 @@ static async Task<bool> CheckQuota(SubscriptionResource subscription, string loc
     var usageByName = new Dictionary<string, (long current, long limit)>(StringComparer.OrdinalIgnoreCase);
     try
     {
-        await foreach (var u in subscription.GetUsagesAsync(location))
+        await foreach (var u in Azure.ResourceManager.Compute.ComputeExtensions.GetUsagesAsync(subscription, location))
             usageByName[u.Name.Value!] = (u.CurrentValue, u.Limit);
     }
     catch (Exception ex) { Console.WriteLine($"WARN [{clusterName}]: Usage lookup failed ({ex.Message}), skipping quota check."); return true; }
@@ -229,4 +235,60 @@ static async Task<bool> CheckQuota(SubscriptionResource subscription, string loc
     return ok;
 }
 
-record PoolInfo(string Name, string Version, int MinorVersion, int Count, string VmSize, string? MaxSurge);
+static int CalcUsableIps(string? cidr)
+{
+    if (string.IsNullOrEmpty(cidr)) return 0;
+    var parts = cidr.Split('/');
+    if (parts.Length != 2 || !int.TryParse(parts[1], out int prefix) || prefix < 0 || prefix > 32)
+        return 0;
+    return (1 << (32 - prefix)) - 5; // Azure reserves 5 IPs per subnet
+}
+
+static async Task<bool> CheckSubnetIpAvailability(ArmClient armClient,
+    ContainerServiceManagedClusterResource cluster, List<PoolInfo> pools, string clusterName)
+{
+    var poolsWithSubnet = pools.Where(p => !string.IsNullOrEmpty(p.VnetSubnetId)).ToList();
+    if (poolsWithSubnet.Count == 0) return true;
+
+    // Azure CNI flat: pods consume VNet IPs directly (1 node IP + maxPods pod IPs per node)
+    // Azure CNI Overlay / Kubenet: only 1 VNet IP per node (pods use private CIDR)
+    bool isCniFlat = cluster.Data.NetworkProfile?.NetworkPlugin == ContainerServiceNetworkPlugin.Azure
+        && cluster.Data.NetworkProfile?.NetworkPluginMode != ContainerServiceNetworkPluginMode.Overlay;
+
+    var bySubnet = poolsWithSubnet.GroupBy(p => p.VnetSubnetId!, StringComparer.OrdinalIgnoreCase);
+
+    Console.WriteLine($"\nSubnet IP check for [{clusterName}]:");
+    Console.WriteLine($"  Network plugin: {cluster.Data.NetworkProfile?.NetworkPlugin}" +
+        $"{(isCniFlat ? " (flat/CNI — IPs per surge node = 1 + maxPods)" : " (overlay/kubenet — IPs per surge node = 1)")}");
+    Console.WriteLine($"  {"Subnet",-45} {"Usable",8} {"Used",8} {"Available",10} {"Required",9}");
+
+    bool ok = true;
+    foreach (var group in bySubnet)
+    {
+        int required = group.Sum(p => CalcSurge(p.MaxSurge, p.Count) * (isCniFlat ? 1 + p.MaxPods : 1));
+        int usable = 0, used = 0;
+        string subnetName = group.Key.Split('/').LastOrDefault() ?? group.Key;
+        try
+        {
+            var subnetData = (await armClient.GetSubnetResource(new ResourceIdentifier(group.Key)).GetAsync()).Value.Data;
+            usable = CalcUsableIps(subnetData.AddressPrefix);
+            used = subnetData.IPConfigurations?.Count ?? 0;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  WARN: Could not fetch subnet '{subnetName}': {ex.Message}");
+            continue;
+        }
+
+        int available = usable - used;
+        bool pass = available >= required;
+        Console.WriteLine($"  {subnetName,-45} {usable,8} {used,8} {available,10} {required,9}  {(pass ? "OK" : "INSUFFICIENT")}");
+        if (!pass) ok = false;
+    }
+    Console.WriteLine();
+
+    if (!ok) Console.WriteLine($"SKIP [{clusterName}]: Insufficient IPs in subnet(s) for upgrade surge.");
+    return ok;
+}
+
+record PoolInfo(string Name, string Version, int MinorVersion, int Count, string VmSize, string? MaxSurge, string? VnetSubnetId, int MaxPods);
